@@ -1,73 +1,46 @@
-use bus::Bus;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
-
-const NUM_CORES: usize = 16;
+use std::io::{BufRead, BufReader};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap();
 
     let file = File::open(path).unwrap();
-    let mut reader = BufReader::new(file);
+    let mut lines = BufReader::new(file).lines();
 
     let cities = std::thread::scope(|s| {
-        let mut channel: Bus<Vec<u8>> = Bus::new(32);
-
         let mut threads = vec![];
-        for i in 0..=NUM_CORES {
-            let mut receiver = channel.add_rx();
-            threads.push(s.spawn(move || {
-                while let Ok(chunk) = receiver.recv() {
-                    let mut cities = HashMap::new();
-                    String::from_utf8_lossy(&chunk).lines().for_each(|line| {
-                        let (city, temp_str) = line.split_once(';').unwrap();
-                        let temp = temp_str.parse().unwrap();
-                        cities
-                            .entry(city.to_owned())
-                            .and_modify(|temps: &mut Vec<f32>| temps.push(temp))
-                            .or_insert(vec![temp]);
-                    });
+        for i in 0..=256 {
+            let (sender, receiver) = std::sync::mpsc::channel::<String>();
+            let task = move || {
+                let mut cities = HashMap::new();
+                while let Ok(line) = receiver.recv() {
+                    let (city, temp_str) = line.split_once(';').unwrap();
+                    let temp = temp_str.parse().unwrap();
+                    cities
+                        .entry(city.to_owned())
+                        .and_modify(|temps: &mut Vec<f32>| temps.push(temp))
+                        .or_insert(vec![temp]);
                 }
                 println!("Exiting thread {i}");
-                // cities
-            }));
+                cities
+            };
+            threads.push((sender, s.spawn(task)));
         }
 
-        let mut buf = [0; 4096 * 16];
-        let mut start = 0;
-        loop {
-            let len = reader.read(&mut buf[start..]).unwrap();
-            if len == 0 {
-                break;
-            }
-            let mut data = &buf[..start + len];
-
-            let overhang = data.rsplit(|byte| *byte == b'\n').next().unwrap();
-            data = &data[..data.len() - overhang.len()];
-            start = overhang.len();
-            let range = data.len()..data.len() + overhang.len();
-
-            channel.broadcast(data.to_vec());
-
-            buf.copy_within(range, 0);
+        while let Some(Ok(line)) = lines.next() {
+            let thread_index = line.as_bytes()[0];
+            threads[thread_index as usize].0.send(line).unwrap();
         }
-        drop(channel);
 
         println!("finished reading");
 
         let mut all_cities: HashMap<String, Vec<f32>> = HashMap::new();
-        for handle in threads {
-            let cities = handle.join().unwrap();
-            // for (city, temps) in cities {
-            //     if let Some(all_temps) = all_cities.get_mut(&city) {
-            //         all_temps.extend(temps);
-            //     } else {
-            //         all_cities.insert(city, temps);
-            //     }
-            // }
+        for (sender, handle) in threads {
+            drop(sender);
+            all_cities.extend(handle.join().unwrap());
         }
 
         all_cities
