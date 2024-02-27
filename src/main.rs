@@ -4,27 +4,27 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use tokio::task::JoinSet;
+use std::thread;
 
 const NUM_THREADS: usize = 16;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap();
 
-    let (sender, receiver) = kanal::unbounded_async::<Vec<u8>>();
-    let mut tasks = JoinSet::new();
+    let (sender, receiver) = kanal::unbounded::<Vec<u8>>();
+    let mut threads = Vec::with_capacity(NUM_THREADS);
     for i in 0..NUM_THREADS {
         let receiver = receiver.clone();
-        tasks.spawn(async move {
+        let handle = thread::spawn(move || {
             let mut cities = HashMap::new();
-            while let Ok(chunk) = receiver.recv().await {
+            while let Ok(chunk) = receiver.recv() {
                 process_chunk(chunk, &mut cities)
             }
             println!("Exiting task {i}");
             cities
         });
+        threads.push(handle);
     }
 
     let file = File::open(path).unwrap();
@@ -36,7 +36,7 @@ async fn main() {
             break;
         }
         let (lines, rest) = chunk[..len_read].rsplit_once(|&b| b == b'\n').unwrap();
-        sender.send(lines.to_owned()).await.unwrap();
+        sender.send(lines.to_owned()).unwrap();
         reader.seek_relative(-(rest.len() as i64)).unwrap();
     }
     drop(sender);
@@ -44,7 +44,8 @@ async fn main() {
     println!("Finished reading");
 
     let mut all_cities: HashMap<String, Vec<f32>> = HashMap::new();
-    while let Some(Ok(cities)) = tasks.join_next().await {
+    for handle in threads {
+        let cities = handle.join().unwrap();
         for (city, temps) in cities {
             if let Some(all_temps) = all_cities.get_mut(&city) {
                 all_temps.extend(temps);
@@ -72,7 +73,7 @@ fn process_chunk(chunk: Vec<u8>, cities: &mut HashMap<String, Vec<f32>>) {
         let temp = String::from_utf8_lossy(temp_str).parse().unwrap();
         cities
             .entry(String::from_utf8_lossy(city).to_string())
-            .and_modify(|temps: &mut Vec<f32>| temps.push(temp))
+            .and_modify(|temps| temps.push(temp))
             .or_insert(vec![temp]);
     }
 }
