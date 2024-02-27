@@ -1,3 +1,6 @@
 /target
 /data/*.txt
+!/data/test-1.txt
+!/data/test-10.txt
+!/data/unique-1000.txt
 /bench

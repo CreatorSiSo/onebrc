@@ -1,6 +1,6 @@
 #![feature(slice_split_once)]
 
-use bstr::{BStr, ByteSlice};
+use bstr::BStr;
 use fxhash::FxHashMap;
 use itertools::Itertools;
 use kanal::{Receiver, Sender};
@@ -8,6 +8,29 @@ use std::cmp::min;
 use std::fs::OpenOptions;
 use std::sync::OnceLock;
 use std::thread;
+
+struct Temperature {
+    min: f32,
+    max: f32,
+    sum: f32,
+    count: u32,
+}
+
+impl Temperature {
+    fn push(&mut self, value: f32) {
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+        self.sum += value;
+        self.count += 1;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum = self.sum + other.sum;
+        self.count = self.count + other.count;
+    }
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -28,18 +51,17 @@ fn main() {
         .map(|handle| handle.join().unwrap())
         .reduce(|mut accum, other| {
             for (city, temps) in other {
-                if let Some(all_temps) = accum.get_mut(&city) {
-                    all_temps.extend(temps);
-                } else {
-                    accum.insert(city, temps);
-                }
+                accum
+                    .entry(&city)
+                    .and_modify(|all_temps| all_temps.merge(&temps))
+                    .or_insert(temps);
             }
             accum
         })
         .unwrap_or_default();
     let out = cities
         .iter()
-        .map(|(city, temps)| format_entry(city.as_bstr(), temps))
+        .map(|(city, temps)| format_entry(BStr::new(city), temps))
         .join(", ");
 
     println!("{{{out}}}");
@@ -67,7 +89,7 @@ fn read_send_chunks(path: String, sender: Sender<&[u8]>) {
     println!("Finished reading");
 }
 
-fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Vec<f32>> {
+fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
     let mut cities = FxHashMap::default();
     while let Ok(chunk) = receiver.recv() {
         for line in chunk.split(|b| *b == b'\n') {
@@ -78,21 +100,25 @@ fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Vec<f32>> {
             let temp = fast_float::parse(temp_bytes).unwrap();
             cities
                 .entry(city)
-                .and_modify(|temps: &mut Vec<f32>| temps.push(temp))
-                .or_insert(vec![temp]);
+                .and_modify(|temps: &mut Temperature| temps.push(temp))
+                .or_insert(Temperature {
+                    min: temp,
+                    max: temp,
+                    sum: temp,
+                    count: 1,
+                });
         }
     }
+
     println!("Exiting thread");
     cities
 }
 
-fn format_entry(city: &BStr, temps: &[f32]) -> String {
-    let min = temps.iter().min_by(|a, b| a.total_cmp(b)).unwrap();
-    let max = temps.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
-    let mean = match temps.len() {
-        1 => temps[0],
-        len if len % 2 == 0 => temps[len / 2],
-        len => (temps[len / 2] + temps[len / 2 + 1]) / 2.0,
-    };
-    format!("{city}={min}/{mean}/{max}")
+fn format_entry(city: &BStr, temps: &Temperature) -> String {
+    format!(
+        "{city}={}/{:.1}/{}",
+        temps.min,
+        temps.sum / temps.count as f32,
+        temps.max
+    )
 }
