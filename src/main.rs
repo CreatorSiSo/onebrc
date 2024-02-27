@@ -1,6 +1,7 @@
 #![feature(slice_split_once)]
 
 use itertools::Itertools;
+use kanal::Receiver;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -14,17 +15,13 @@ fn main() {
 
     let (sender, receiver) = kanal::unbounded::<Vec<u8>>();
     let mut threads = Vec::with_capacity(NUM_THREADS);
-    for i in 0..NUM_THREADS {
+    for _ in 0..NUM_THREADS {
         let receiver = receiver.clone();
-        let handle = thread::spawn(move || {
-            let mut cities = HashMap::new();
-            while let Ok(chunk) = receiver.recv() {
-                process_chunk(chunk, &mut cities)
-            }
-            println!("Exiting task {i}");
-            cities
-        });
-        threads.push(handle);
+        threads.push(thread::spawn(move || {
+            let result = process_chunks(receiver);
+            println!("Exiting thread");
+            result
+        }));
     }
 
     let file = File::open(path).unwrap();
@@ -43,39 +40,45 @@ fn main() {
 
     println!("Finished reading");
 
-    let mut all_cities: HashMap<String, Vec<f32>> = HashMap::new();
-    for handle in threads {
-        let cities = handle.join().unwrap();
-        for (city, temps) in cities {
-            if let Some(all_temps) = all_cities.get_mut(&city) {
-                all_temps.extend(temps);
-            } else {
-                all_cities.insert(city, temps);
+    let cities = threads
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .reduce(|mut accum, other| {
+            for (city, temps) in other {
+                if let Some(all_temps) = accum.get_mut(&city) {
+                    all_temps.extend(temps);
+                } else {
+                    accum.insert(city, temps);
+                }
             }
-        }
-    }
-
-    let out = all_cities
+            accum
+        })
+        .unwrap_or_default();
+    let out = cities
         .iter()
         .map(|(city, temps)| format_entry(city, temps))
         .join(", ");
 
     println!("{{{out}}}");
-    println!("{}", all_cities.len());
+    println!("{}", cities.len());
 }
 
-fn process_chunk(chunk: Vec<u8>, cities: &mut HashMap<String, Vec<f32>>) {
-    for line in chunk.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
+fn process_chunks(receiver: Receiver<Vec<u8>>) -> HashMap<String, Vec<f32>> {
+    let mut cities = HashMap::new();
+    while let Ok(chunk) = receiver.recv() {
+        for line in chunk.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let (city, temp_str) = line.split_once(|b| *b == b';').unwrap();
+            let temp = String::from_utf8_lossy(temp_str).parse().unwrap();
+            cities
+                .entry(String::from_utf8_lossy(city).to_string())
+                .and_modify(|temps: &mut Vec<f32>| temps.push(temp))
+                .or_insert(vec![temp]);
         }
-        let (city, temp_str) = line.split_once(|b| *b == b';').unwrap();
-        let temp = String::from_utf8_lossy(temp_str).parse().unwrap();
-        cities
-            .entry(String::from_utf8_lossy(city).to_string())
-            .and_modify(|temps| temps.push(temp))
-            .or_insert(vec![temp]);
     }
+    cities
 }
 
 fn format_entry(city: &str, temps: &[f32]) -> String {
