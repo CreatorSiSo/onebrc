@@ -3,46 +3,25 @@
 use bstr::{BStr, ByteSlice};
 use fxhash::FxHashMap;
 use itertools::Itertools;
-use kanal::Receiver;
+use kanal::{Receiver, Sender};
 use std::cmp::min;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::sync::OnceLock;
 use std::thread;
-
-const NUM_THREADS: usize = 16;
-const MAX_CHUNK: usize = 16 * 1024 * 1024;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap();
 
-    let file = File::open(path).unwrap();
-    static MMAP: OnceLock<memmap2::Mmap> = OnceLock::new();
-    // (UN)SAFETY: If someone else modifies the file while we are reading it, we are just fucked
-    let mmap = MMAP.get_or_init(|| unsafe { memmap2::Mmap::map(&file) }.unwrap());
-
     let (sender, receiver) = kanal::unbounded::<&[u8]>();
-    let threads = (0..NUM_THREADS)
+    let num_threads = thread::available_parallelism().unwrap().into();
+    let threads: Vec<_> = (0..num_threads)
         .map(|_| {
             let receiver = receiver.clone();
-            thread::spawn(move || {
-                let result = process_chunks(receiver);
-                println!("Exiting thread");
-                result
-            })
+            thread::spawn(move || process_chunks(receiver))
         })
-        .collect_vec();
-
-    let mut start = 0;
-    while start < mmap.len() {
-        let chunk = &mmap[start..min(start + MAX_CHUNK, mmap.len())];
-        let (lines, rest) = chunk.rsplit_once(|&b| b == b'\n').unwrap();
-        sender.send(lines).unwrap();
-        start += MAX_CHUNK - rest.len();
-    }
-    drop(sender);
-
-    println!("Finished reading");
+        .collect();
+    read_send_chunks(path, sender);
 
     let cities = threads
         .into_iter()
@@ -67,6 +46,27 @@ fn main() {
     println!("{}", cities.len());
 }
 
+fn read_send_chunks(path: String, sender: Sender<&[u8]>) {
+    const CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+    // Open file in read-only mode
+    let file = OpenOptions::new().read(true).open(path).unwrap();
+    // TODO Lock file in shared read-only mode
+    static MMAP: OnceLock<memmap2::Mmap> = OnceLock::new();
+    // (UN)SAFETY: If someone else modifies the file while we are reading it, we are just fucked
+    let mmap = MMAP.get_or_init(|| unsafe { memmap2::Mmap::map(&file) }.unwrap());
+
+    let mut start = 0;
+    while start < mmap.len() {
+        let chunk = &mmap[start..min(start + CHUNK_SIZE, mmap.len())];
+        let (lines, rest) = chunk.rsplit_once(|&b| b == b'\n').unwrap();
+        sender.send(lines).unwrap();
+        start += CHUNK_SIZE - rest.len();
+    }
+
+    println!("Finished reading");
+}
+
 fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Vec<f32>> {
     let mut cities = FxHashMap::default();
     while let Ok(chunk) = receiver.recv() {
@@ -82,6 +82,7 @@ fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Vec<f32>> {
                 .or_insert(vec![temp]);
         }
     }
+    println!("Exiting thread");
     cities
 }
 
