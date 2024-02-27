@@ -6,6 +6,7 @@ use itertools::Itertools;
 use kanal::{Receiver, Sender};
 use std::cmp::min;
 use std::fs::OpenOptions;
+use std::io::{stderr, Write};
 use std::sync::OnceLock;
 use std::thread;
 
@@ -65,7 +66,7 @@ fn main() {
         .join(", ");
 
     println!("{{{out}}}");
-    println!("{}", cities.len());
+    writeln!(stderr().lock(), "{}", cities.len()).unwrap();
 }
 
 fn read_send_chunks(path: String, sender: Sender<&[u8]>) {
@@ -86,7 +87,7 @@ fn read_send_chunks(path: String, sender: Sender<&[u8]>) {
         start += CHUNK_SIZE - rest.len();
     }
 
-    println!("Finished reading");
+    writeln!(stderr().lock(), "Finished reading").unwrap();
 }
 
 fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
@@ -110,7 +111,7 @@ fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
         }
     }
 
-    println!("Exiting thread");
+    writeln!(stderr().lock(), "Exiting thread").unwrap();
     cities
 }
 
