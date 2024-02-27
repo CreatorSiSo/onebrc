@@ -1,8 +1,9 @@
 #![feature(slice_split_once)]
 
+use bstr::{BStr, BString, ByteSlice};
+use fxhash::FxHashMap;
 use itertools::Itertools;
 use kanal::Receiver;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::thread;
@@ -14,15 +15,16 @@ fn main() {
     let path = args.next().unwrap();
 
     let (sender, receiver) = kanal::unbounded::<Vec<u8>>();
-    let mut threads = Vec::with_capacity(NUM_THREADS);
-    for _ in 0..NUM_THREADS {
-        let receiver = receiver.clone();
-        threads.push(thread::spawn(move || {
-            let result = process_chunks(receiver);
-            println!("Exiting thread");
-            result
-        }));
-    }
+    let threads = (0..NUM_THREADS)
+        .map(|_| {
+            let receiver = receiver.clone();
+            thread::spawn(move || {
+                let result = process_chunks(receiver);
+                println!("Exiting thread");
+                result
+            })
+        })
+        .collect_vec();
 
     let file = File::open(path).unwrap();
     let mut reader = BufReader::new(file);
@@ -56,24 +58,24 @@ fn main() {
         .unwrap_or_default();
     let out = cities
         .iter()
-        .map(|(city, temps)| format_entry(city, temps))
+        .map(|(city, temps)| format_entry(city.as_bstr(), temps))
         .join(", ");
 
     println!("{{{out}}}");
     println!("{}", cities.len());
 }
 
-fn process_chunks(receiver: Receiver<Vec<u8>>) -> HashMap<String, Vec<f32>> {
-    let mut cities = HashMap::new();
+fn process_chunks(receiver: Receiver<Vec<u8>>) -> FxHashMap<BString, Vec<f32>> {
+    let mut cities = FxHashMap::default();
     while let Ok(chunk) = receiver.recv() {
         for line in chunk.split(|b| *b == b'\n') {
             if line.is_empty() {
                 continue;
             }
-            let (city, temp_str) = line.split_once(|b| *b == b';').unwrap();
-            let temp = String::from_utf8_lossy(temp_str).parse().unwrap();
+            let (city, temp_bytes) = line.split_once(|b| *b == b';').unwrap();
+            let temp = fast_float::parse(temp_bytes).unwrap();
             cities
-                .entry(String::from_utf8_lossy(city).to_string())
+                .entry(BString::from(city))
                 .and_modify(|temps: &mut Vec<f32>| temps.push(temp))
                 .or_insert(vec![temp]);
         }
@@ -81,7 +83,7 @@ fn process_chunks(receiver: Receiver<Vec<u8>>) -> HashMap<String, Vec<f32>> {
     cities
 }
 
-fn format_entry(city: &str, temps: &[f32]) -> String {
+fn format_entry(city: &BStr, temps: &[f32]) -> String {
     let min = temps.iter().min_by(|a, b| a.total_cmp(b)).unwrap();
     let max = temps.iter().max_by(|a, b| a.total_cmp(b)).unwrap();
     let mean = match temps.len() {
