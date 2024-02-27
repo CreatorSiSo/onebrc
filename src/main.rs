@@ -1,20 +1,27 @@
 #![feature(slice_split_once)]
 
-use bstr::{BStr, BString, ByteSlice};
+use bstr::{BStr, ByteSlice};
 use fxhash::FxHashMap;
 use itertools::Itertools;
 use kanal::Receiver;
+use std::cmp::min;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::sync::OnceLock;
 use std::thread;
 
 const NUM_THREADS: usize = 16;
+const MAX_CHUNK: usize = 16 * 1024 * 1024;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap();
 
-    let (sender, receiver) = kanal::unbounded::<Vec<u8>>();
+    let file = File::open(path).unwrap();
+    static MMAP: OnceLock<memmap2::Mmap> = OnceLock::new();
+    // (UN)SAFETY: If someone else modifies the file while we are reading it, we are just fucked
+    let mmap = MMAP.get_or_init(|| unsafe { memmap2::Mmap::map(&file) }.unwrap());
+
+    let (sender, receiver) = kanal::unbounded::<&[u8]>();
     let threads = (0..NUM_THREADS)
         .map(|_| {
             let receiver = receiver.clone();
@@ -26,17 +33,12 @@ fn main() {
         })
         .collect_vec();
 
-    let file = File::open(path).unwrap();
-    let mut reader = BufReader::new(file);
-    let mut chunk = [0; 1_000_000];
-    loop {
-        let len_read = reader.read(&mut chunk).unwrap();
-        if len_read == 0 {
-            break;
-        }
-        let (lines, rest) = chunk[..len_read].rsplit_once(|&b| b == b'\n').unwrap();
-        sender.send(lines.to_owned()).unwrap();
-        reader.seek_relative(-(rest.len() as i64)).unwrap();
+    let mut start = 0;
+    while start < mmap.len() {
+        let chunk = &mmap[start..min(start + MAX_CHUNK, mmap.len())];
+        let (lines, rest) = chunk.rsplit_once(|&b| b == b'\n').unwrap();
+        sender.send(lines).unwrap();
+        start += MAX_CHUNK - rest.len();
     }
     drop(sender);
 
@@ -65,7 +67,7 @@ fn main() {
     println!("{}", cities.len());
 }
 
-fn process_chunks(receiver: Receiver<Vec<u8>>) -> FxHashMap<BString, Vec<f32>> {
+fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Vec<f32>> {
     let mut cities = FxHashMap::default();
     while let Ok(chunk) = receiver.recv() {
         for line in chunk.split(|b| *b == b'\n') {
@@ -75,7 +77,7 @@ fn process_chunks(receiver: Receiver<Vec<u8>>) -> FxHashMap<BString, Vec<f32>> {
             let (city, temp_bytes) = line.split_once(|b| *b == b';').unwrap();
             let temp = fast_float::parse(temp_bytes).unwrap();
             cities
-                .entry(BString::from(city))
+                .entry(city)
                 .and_modify(|temps: &mut Vec<f32>| temps.push(temp))
                 .or_insert(vec![temp]);
         }
