@@ -6,7 +6,7 @@ use itertools::Itertools;
 use kanal::{Receiver, Sender};
 use std::cmp::min;
 use std::fs::OpenOptions;
-use std::io::{stderr, Write};
+use std::num::NonZero;
 use std::sync::OnceLock;
 use std::thread;
 
@@ -18,10 +18,19 @@ struct Temperature {
 }
 
 impl Temperature {
-    fn push(&mut self, value: f32) {
-        self.min = self.min.min(value);
-        self.max = self.max.max(value);
-        self.sum += value;
+    fn new(temp: f32) -> Self {
+        Self {
+            min: temp,
+            max: temp,
+            sum: temp,
+            count: 1,
+        }
+    }
+
+    fn push(&mut self, temp: f32) {
+        self.min = self.min.min(temp);
+        self.max = self.max.max(temp);
+        self.sum += temp;
         self.count += 1;
     }
 
@@ -37,17 +46,22 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap();
 
+    const DEFAUL_NUM_THREADS: usize = 4;
+    let num_threads = thread::available_parallelism()
+        .map(NonZero::get)
+        .unwrap_or(DEFAUL_NUM_THREADS);
+
     let (sender, receiver) = kanal::unbounded::<&[u8]>();
-    let num_threads = thread::available_parallelism().unwrap().into();
-    let threads: Vec<_> = (0..num_threads)
+    let handles = (0..num_threads)
         .map(|_| {
             let receiver = receiver.clone();
             thread::spawn(move || process_chunks(receiver))
         })
-        .collect();
+        .collect::<Vec<_>>();
+
     read_send_chunks(path, sender);
 
-    let cities = threads
+    let cities = handles
         .into_iter()
         .map(|handle| handle.join().unwrap())
         .reduce(|mut accum, other| {
@@ -66,7 +80,7 @@ fn main() {
         .join(", ");
 
     println!("{{{out}}}");
-    writeln!(stderr().lock(), "{}", cities.len()).unwrap();
+    eprintln!("{}", cities.len());
 }
 
 fn read_send_chunks(path: String, sender: Sender<&[u8]>) {
@@ -87,11 +101,12 @@ fn read_send_chunks(path: String, sender: Sender<&[u8]>) {
         start += CHUNK_SIZE - rest.len();
     }
 
-    writeln!(stderr().lock(), "Finished reading").unwrap();
+    eprintln!("Finished reading");
 }
 
 fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
     let mut cities = FxHashMap::default();
+
     while let Ok(chunk) = receiver.recv() {
         for line in chunk.split(|b| *b == b'\n') {
             if line.is_empty() {
@@ -102,16 +117,11 @@ fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
             cities
                 .entry(city)
                 .and_modify(|temps: &mut Temperature| temps.push(temp))
-                .or_insert(Temperature {
-                    min: temp,
-                    max: temp,
-                    sum: temp,
-                    count: 1,
-                });
+                .or_insert(Temperature::new(temp));
         }
     }
 
-    writeln!(stderr().lock(), "Exiting thread").unwrap();
+    eprintln!("Exiting thread");
     cities
 }
 
