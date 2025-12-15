@@ -14,5 +14,7 @@ lto = "fat"
 
 [profile.release]
 debug = true
+strip = "none"
 panic = "abort"
 lto = "fat"
+codegen-units = 1
