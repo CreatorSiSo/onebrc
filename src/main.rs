@@ -36,8 +36,8 @@ impl Temperature {
     fn merge(&mut self, other: &Self) {
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
-        self.sum = self.sum + other.sum;
-        self.count = self.count + other.count;
+        self.sum += other.sum;
+        self.count += other.count;
     }
 }
 
@@ -66,7 +66,7 @@ fn main() {
         .reduce(|mut accum, other| {
             for (city, temps) in other {
                 accum
-                    .entry(&city)
+                    .entry(city)
                     .and_modify(|all_temps| all_temps.merge(&temps))
                     .or_insert(temps);
             }
