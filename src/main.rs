@@ -6,6 +6,7 @@ use std::cmp::min;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::num::NonZero;
+use std::os::raw::c_void;
 use std::sync::mpmc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread;
@@ -22,8 +23,7 @@ fn main() {
     let mmap = MMAP.get_or_init(|| unsafe { memmap2::Mmap::map(&file) }.unwrap());
     mmap.advise(memmap2::Advice::Sequential).unwrap();
 
-    let results = single_threaded(&mmap);
-    let sorted = BTreeMap::from_iter(results.into_iter());
+    let sorted = BTreeMap::from_iter(single_threaded(&mmap));
 
     let out = sorted
         .into_iter()
@@ -92,8 +92,8 @@ impl Decimal {
 
         inner += digit_from_byte(bytes[index_last]);
         inner += digit_from_byte(bytes[index_last - 2]) * 10;
-        let has_hundreds = (bytes.len() - (is_negative as usize)) == 4;
-        if has_hundreds {
+        let has_tens = (bytes.len() - (is_negative as usize)) == 4;
+        if has_tens {
             inner += digit_from_byte(bytes[index_last - 3]) * 100;
         }
 
@@ -175,16 +175,42 @@ fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
 }
 
 fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>) {
-    for line in chunk.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let (city, temp_bytes) = line.split_once(|b| *b == b';').unwrap();
+    let mut rest = chunk;
+
+    while let Some(line) = next_line(&mut rest) {
+        let (city, temp_bytes) = split_line(line);
         let temp = Decimal::parse(temp_bytes);
         map.entry(city)
             .and_modify(|temps: &mut Temperature| temps.push(temp))
             .or_insert(Temperature::new(temp));
     }
+}
+
+fn next_line<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let line_end =
+        unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as i32, rest.len()) };
+    if line_end.is_null() {
+        return None;
+    }
+
+    let line_len = unsafe { line_end.byte_offset_from_unsigned(rest.as_ptr() as *mut u8) };
+    let line = &rest[..line_len];
+    if line.is_empty() {
+        return None;
+    }
+    *rest = &rest[line_len + 1..];
+
+    Some(line)
+}
+
+fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
+    let start = line.as_ptr() as *const c_void;
+
+    // ignoring null, format specifies that there is always a semi on the line
+    let split_ptr = unsafe { libc::memchr(start, b';' as i32, line.len()) };
+    let split_pos = unsafe { split_ptr.byte_offset_from_unsigned(start as *mut u8) };
+
+    (&line[..split_pos], &line[split_pos + 1..])
 }
 
 fn format_entry(city: &[u8], temps: &Temperature) -> String {

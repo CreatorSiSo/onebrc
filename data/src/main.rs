@@ -4,7 +4,9 @@ use std::{env::args, fs::File, io::Write, num::NonZero};
 const STATIONS: &str = include_str!("../weather_stations.csv");
 
 fn main() {
-    let rows: usize = args().skip(1).next().unwrap().parse().unwrap();
+    let mut args = args().skip(1);
+    let dest = args.next().unwrap();
+    let rows: usize = args.next().unwrap().parse().unwrap();
     let min_max_table = &*Box::leak(generate_min_max_table());
 
     let n_threads = std::thread::available_parallelism().unwrap_or(NonZero::new(1).unwrap());
@@ -14,7 +16,7 @@ fn main() {
     let handles = (0..n_threads.get())
         .map(|_| std::thread::spawn(move || generate_data(min_max_table, rows_chunk)));
 
-    let mut file = File::create("./measurements.txt").unwrap();
+    let mut file = File::create(dest).unwrap();
     for handle in handles {
         let lines = handle.join().unwrap();
         file.write_all(lines.as_bytes()).unwrap();
