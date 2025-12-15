@@ -13,4 +13,5 @@ lto = "fat"
 
 [profile.release]
 debug = false
+panic = "abort"
 lto = "fat"

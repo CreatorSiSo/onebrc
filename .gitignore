@@ -5,3 +5,5 @@
 !/data/test-10.txt
 !/data/unique-1000.txt
 /bench
+perf.data
+perf.data.old
