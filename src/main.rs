@@ -1,12 +1,11 @@
 #![feature(slice_split_once)]
+#![feature(mpmc_channel)]
 
-use bstr::BStr;
-use fxhash::FxHashMap;
-use itertools::Itertools;
-use kanal::{Receiver, Sender};
+use rustc_hash::FxHashMap;
 use std::cmp::min;
 use std::fs::OpenOptions;
 use std::num::NonZero;
+use std::sync::mpmc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread;
 
@@ -51,7 +50,7 @@ fn main() {
         .map(NonZero::get)
         .unwrap_or(DEFAUL_NUM_THREADS);
 
-    let (sender, receiver) = kanal::unbounded::<&[u8]>();
+    let (sender, receiver) = std::sync::mpmc::channel::<&[u8]>();
     let handles = (0..num_threads)
         .map(|_| {
             let receiver = receiver.clone();
@@ -76,8 +75,13 @@ fn main() {
         .unwrap_or_default();
     let out = cities
         .iter()
-        .map(|(city, temps)| format_entry(BStr::new(city), temps))
-        .join(", ");
+        .fold(String::new(), |mut accum, (city, temps)| {
+            if !accum.is_empty() {
+                accum += ", ";
+            }
+            accum.push_str(&format_entry(city, temps));
+            accum
+        });
 
     println!("{{{out}}}");
     eprintln!("{}", cities.len());
@@ -113,7 +117,9 @@ fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
                 continue;
             }
             let (city, temp_bytes) = line.split_once(|b| *b == b';').unwrap();
-            let temp = fast_float::parse(temp_bytes).unwrap();
+            // SAFETY: Input is promised to be valid utf8
+            let temp_str = unsafe { str::from_utf8_unchecked(temp_bytes) };
+            let temp = temp_str.parse().unwrap();
             cities
                 .entry(city)
                 .and_modify(|temps: &mut Temperature| temps.push(temp))
@@ -125,9 +131,11 @@ fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
     cities
 }
 
-fn format_entry(city: &BStr, temps: &Temperature) -> String {
+fn format_entry(city: &[u8], temps: &Temperature) -> String {
     format!(
-        "{city}={}/{:.1}/{}",
+        "{}={}/{:.1}/{}",
+        // SAFETY: Input is promised to be valid utf8
+        unsafe { str::from_utf8_unchecked(city) },
         temps.min,
         temps.sum / temps.count as f32,
         temps.max
