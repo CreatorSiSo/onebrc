@@ -3,43 +3,12 @@
 
 use rustc_hash::FxHashMap;
 use std::cmp::min;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::num::NonZero;
 use std::sync::mpmc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread;
-
-struct Temperature {
-    min: f32,
-    max: f32,
-    sum: f32,
-    count: u32,
-}
-
-impl Temperature {
-    fn new(temp: f32) -> Self {
-        Self {
-            min: temp,
-            max: temp,
-            sum: temp,
-            count: 1,
-        }
-    }
-
-    fn push(&mut self, temp: f32) {
-        self.min = self.min.min(temp);
-        self.max = self.max.max(temp);
-        self.sum += temp;
-        self.count += 1;
-    }
-
-    fn merge(&mut self, other: &Self) {
-        self.min = self.min.min(other.min);
-        self.max = self.max.max(other.max);
-        self.sum += other.sum;
-        self.count += other.count;
-    }
-}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -51,17 +20,91 @@ fn main() {
     static MMAP: OnceLock<memmap2::Mmap> = OnceLock::new();
     // (UN)SAFETY: If someone else modifies the file while we are reading it, we are just fucked
     let mmap = MMAP.get_or_init(|| unsafe { memmap2::Mmap::map(&file) }.unwrap());
+    mmap.advise(memmap2::Advice::Sequential).unwrap();
 
-    let out = single_threaded(&mmap).fold(String::new(), |mut accum, (city, temps)| {
-        if !accum.is_empty() {
-            accum += ", ";
-        }
-        accum.push_str(&format_entry(city, &temps));
-        accum
-    });
+    let results = single_threaded(&mmap);
+    let sorted = BTreeMap::from_iter(results.into_iter());
+
+    let out = sorted
+        .into_iter()
+        .fold(String::new(), |mut accum, (city, temps)| {
+            if !accum.is_empty() {
+                accum += ", ";
+            }
+            accum.push_str(&format_entry(&city, &temps));
+            accum
+        });
 
     println!("{{{out}}}");
     // eprintln!("{}", cities.len());
+}
+
+struct Temperature {
+    min: Decimal,
+    max: Decimal,
+    sum: f32,
+    count: u32,
+}
+
+impl Temperature {
+    fn new(temp: Decimal) -> Self {
+        Self {
+            min: temp,
+            max: temp,
+            sum: temp.as_f32(),
+            count: 1,
+        }
+    }
+
+    fn push(&mut self, temp: Decimal) {
+        self.min = self.min.min(temp);
+        self.max = self.max.max(temp);
+        self.sum += temp.as_f32();
+        self.count += 1;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
+    }
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Decimal(i16);
+
+impl Decimal {
+    /// bytes must be of length 3..=5 with the format
+    ///
+    /// decimal ::= "-"? digit? digit "." digit
+    /// digit ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+    fn parse(bytes: &[u8]) -> Self {
+        #[inline(always)]
+        const fn digit_from_byte(byte: u8) -> i16 {
+            (byte - b'0') as i16
+        }
+
+        let mut inner = 0i16;
+        let index_last = bytes.len() - 1;
+
+        let is_negative = (bytes[0] - b'-') == 0x00;
+
+        inner += digit_from_byte(bytes[index_last]);
+        inner += digit_from_byte(bytes[index_last - 2]) * 10;
+        let has_hundreds = (bytes.len() - (is_negative as usize)) == 4;
+        if has_hundreds {
+            inner += digit_from_byte(bytes[index_last - 3]) * 100;
+        }
+
+        inner *= if is_negative { -1 } else { 1 };
+
+        Self(inner)
+    }
+
+    fn as_f32(self) -> f32 {
+        (self.0 as f32) / 10.0
+    }
 }
 
 fn single_threaded(data: &[u8]) -> impl Iterator<Item = (&[u8], Temperature)> {
@@ -137,9 +180,7 @@ fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>
             continue;
         }
         let (city, temp_bytes) = line.split_once(|b| *b == b';').unwrap();
-        // SAFETY: Input is promised to be valid utf8
-        let temp_str = unsafe { str::from_utf8_unchecked(temp_bytes) };
-        let temp = temp_str.parse().unwrap();
+        let temp = Decimal::parse(temp_bytes);
         map.entry(city)
             .and_modify(|temps: &mut Temperature| temps.push(temp))
             .or_insert(Temperature::new(temp));
@@ -148,11 +189,11 @@ fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>
 
 fn format_entry(city: &[u8], temps: &Temperature) -> String {
     format!(
-        "{}={}/{:.1}/{}",
+        "{}={:.1}/{:.1}/{:.1}",
         // SAFETY: Input is promised to be valid utf8
         unsafe { str::from_utf8_unchecked(city) },
-        temps.min,
+        temps.min.as_f32(),
         temps.sum / temps.count as f32,
-        temps.max
+        temps.max.as_f32()
     )
 }

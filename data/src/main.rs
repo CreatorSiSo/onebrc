@@ -55,7 +55,7 @@ fn generate_data(min_max_table: &[(&'static str, f32, f32)], rows: usize) -> Str
         let (station, min, max) = min_max_table[rng.random_range(0..min_max_table.len())];
         lines.push_str(station);
         lines.push(';');
-        lines.push_str(&rng.random_range(min..=max).to_string());
+        lines.push_str(&format!("{:.1}", rng.random_range(min..=max)));
         lines.push('\n');
     }
 
