@@ -21,7 +21,7 @@ fn main() {
     let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     // mmap.advise(memmap2::Advice::Sequential).unwrap();
 
-    let sorted = BTreeMap::from_iter(single_threaded::do_work(&mmap));
+    let sorted = BTreeMap::from_iter(multi_threaded::do_work(&mmap));
 
     let out = sorted
         .into_iter()
@@ -34,7 +34,6 @@ fn main() {
         });
 
     println!("{{{out}}}");
-    // eprintln!("{}", cities.len());
 }
 
 struct Temperature {
@@ -182,6 +181,8 @@ mod multi_threaded {
             .map(NonZero::get)
             .unwrap_or(DEFAUL_NUM_THREADS);
 
+        eprintln!("Number of threads: {num_threads}");
+
         let (sender, receiver) = std::sync::mpmc::channel::<&[u8]>();
 
         std::thread::scope(|scope| {
@@ -192,7 +193,7 @@ mod multi_threaded {
                 })
                 .collect();
 
-            read_send_chunks(data, sender);
+            read_send_chunks(data, num_threads, sender);
 
             handles
                 .into_iter()
@@ -215,15 +216,20 @@ mod multi_threaded {
         .into_iter()
     }
 
-    fn read_send_chunks<'a>(data: &'a [u8], sender: Sender<&'a [u8]>) {
-        const CHUNK_SIZE: usize = 16 * 1024 * 1024;
+    fn read_send_chunks<'a>(data: &'a [u8], n_chunks: usize, sender: Sender<&'a [u8]>) {
+        let chunk_size = data.len() / n_chunks;
 
         let mut start = 0;
+        let mut i = 0;
         while start < data.len() {
-            let chunk = &data[start..min(start + CHUNK_SIZE, data.len())];
+            let chunk = &data[start..min(start + chunk_size, data.len())];
             let (lines, rest) = chunk.rsplit_once(|&b| b == b'\n').unwrap();
+
+            eprintln!("Sending chunk {i}, size = {}", lines.len());
+            i += 1;
+
             sender.send(lines).unwrap();
-            start += CHUNK_SIZE - rest.len();
+            start += chunk_size - rest.len();
         }
 
         eprintln!("Finished reading");
