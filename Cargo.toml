@@ -13,6 +13,7 @@ debug = true
 lto = "fat"
 
 [profile.release]
+opt-level = 3
 debug = true
 strip = "none"
 panic = "abort"

@@ -118,7 +118,6 @@ fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
 fn format_entry(city: String, temps: &Temperature) -> String {
     format!(
         "{}={:.1}/{:.1}/{:.1}",
-        // SAFETY: Input is promised to be valid utf8
         city,
         temps.min.as_f32(),
         temps.sum / temps.count as f32,
@@ -136,7 +135,6 @@ impl Decimal {
     ///
     /// decimal ::= ";" "-"? digit? digit "." digit
     /// digit ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    #[inline(never)]
     fn parse(bytes: &[u8]) -> Self {
         #[inline(always)]
         const fn digit_from_byte(byte: u8) -> i16 {
@@ -175,6 +173,7 @@ mod single_threaded {
     pub fn do_work(data: &[u8]) -> BTreeMap<String, Temperature> {
         BTreeMap::from_iter(process_chunk(data).into_iter().map(|(city, temps)| {
             (
+                // SAFETY: Input is promised to be valid utf8
                 unsafe { String::from_utf8_unchecked(Vec::from(city)) },
                 temps,
             )
@@ -203,6 +202,7 @@ mod multi_threaded {
             drop(sender);
             for stat in receiver {
                 for (city, temps) in stat {
+                    // SAFETY: Input is promised to be valid utf8
                     let name = unsafe { String::from_utf8_unchecked(Vec::from(city)) };
                     match stats.entry(name) {
                         Entry::Vacant(vacant) => {
