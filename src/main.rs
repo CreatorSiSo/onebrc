@@ -104,6 +104,7 @@ fn next_line<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
     }
 }
 
+/// Second element in result contains semicolon at index 0
 fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
     let start = line.as_ptr() as *const c_void;
 
@@ -111,7 +112,7 @@ fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
     let split_ptr = unsafe { libc::memchr(start, i32::from(b';'), line.len()) };
     let split_pos = unsafe { split_ptr.offset_from_unsigned(start) };
 
-    (&line[..split_pos], &line[split_pos + 1..])
+    (&line[..split_pos], &line[split_pos..])
 }
 
 fn format_entry(city: &[u8], temps: &Temperature) -> String {
@@ -129,9 +130,11 @@ fn format_entry(city: &[u8], temps: &Temperature) -> String {
 struct Decimal(i16);
 
 impl Decimal {
-    /// bytes must be of length 3..=5 with the format
+    /// bytes must be of length 4..=6 (first byte is a semicolon and not part of the decimal)
     ///
-    /// decimal ::= "-"? digit? digit "." digit
+    /// with the format:
+    ///
+    /// decimal ::= ";" "-"? digit? digit "." digit
     /// digit ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
     fn parse(bytes: &[u8]) -> Self {
         #[inline(always)]
@@ -139,19 +142,21 @@ impl Decimal {
             (byte - b'0') as i16
         }
 
+        // ignore padding byte at index 0
+        let first = 1;
+        let last = bytes.len() - 1;
+
+        let is_negative = bytes[first] == b'-';
+        let has_tens = !(bytes[last - 3] == b'-' || bytes[last - 3] == b';');
+
         let mut inner = 0i16;
-        let index_last = bytes.len() - 1;
-
-        let is_negative = (bytes[0] - b'-') == 0x00;
-
-        inner += digit_from_byte(bytes[index_last]);
-        inner += digit_from_byte(bytes[index_last - 2]) * 10;
-        let has_tens = (bytes.len() - (is_negative as usize)) == 4;
-        if has_tens {
-            inner += digit_from_byte(bytes[index_last - 3]) * 100;
-        }
+        inner += digit_from_byte(bytes[last]);
+        inner += digit_from_byte(bytes[last - 2]) * 10;
+        inner += digit_from_byte(bytes[last - 3]) * (has_tens as i16) * 100;
 
         inner *= if is_negative { -1 } else { 1 };
+
+        // eprintln!("{} -> {}", str::from_utf8(bytes).unwrap(), inner);
 
         Self(inner)
     }
