@@ -223,13 +223,19 @@ mod multi_threaded {
     }
 
     fn create_chunks(data: &[u8], num_threads: usize) -> Vec<&[u8]> {
-        let chunk_size = data.len() / num_threads;
+        let mut chunk_size = data.len() / num_threads;
+        if data.len() < chunk_size {
+            chunk_size = data.len();
+        }
         let mut chunks = Vec::new();
 
         let mut start = 0;
         while start < data.len() {
             let chunk = &data[start..min(start + chunk_size, data.len())];
-            let (lines, rest) = chunk.rsplit_once(|&b| b == b'\n').unwrap();
+
+            let Some((lines, rest)) = chunk.rsplit_once(|&b| b == b'\n') else {
+                unreachable!()
+            };
             chunks.push(lines);
             start += chunk_size - rest.len();
         }
