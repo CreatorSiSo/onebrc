@@ -21,8 +21,6 @@ fn main() {
 
     let stats = multi_threaded::do_work(&mmap);
 
-    eprintln!("Collected stats");
-
     let out = stats
         .into_iter()
         .fold(String::new(), |mut accum, (city, temps)| {
@@ -69,7 +67,8 @@ impl Temperature {
 }
 
 fn process_chunk(chunk: &[u8]) -> FxHashMap<&[u8], Temperature> {
-    let mut stats = FxHashMap::with_capacity_and_hasher(1024, FxBuildHasher);
+    let mut stats =
+        FxHashMap::<_, Temperature>::with_capacity_and_hasher(10_000, FxBuildHasher::default());
     let mut rest = chunk;
 
     loop {
@@ -79,10 +78,11 @@ fn process_chunk(chunk: &[u8]) -> FxHashMap<&[u8], Temperature> {
         }
         let (city, temp_bytes) = split_line(line);
         let temp = Decimal::parse(temp_bytes);
-        stats
-            .entry(city)
-            .and_modify(|temps: &mut Temperature| temps.push(temp))
-            .or_insert(Temperature::new(temp));
+        if let Some(temps) = stats.get_mut(city) {
+            temps.push(temp);
+        } else {
+            stats.insert(city, Temperature::new(temp));
+        }
     }
 
     stats
@@ -98,8 +98,8 @@ fn next_line<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
         line
     } else {
         let line_len = unsafe { line_end.offset_from_unsigned(start) };
-        let line = &rest[..line_len];
-        *rest = &rest[line_len + 1..];
+        let line = unsafe { &rest.get_unchecked(..line_len) };
+        *rest = unsafe { &rest.get_unchecked(line_len + 1..) };
         line
     }
 }
@@ -112,7 +112,12 @@ fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
     let split_ptr = unsafe { libc::memchr(start, i32::from(b';'), line.len()) };
     let split_pos = unsafe { split_ptr.offset_from_unsigned(start) };
 
-    (&line[..split_pos], &line[split_pos..])
+    unsafe {
+        (
+            &line.get_unchecked(..split_pos),
+            &line.get_unchecked(split_pos..),
+        )
+    }
 }
 
 fn format_entry(city: String, temps: &Temperature) -> String {
@@ -189,13 +194,11 @@ mod multi_threaded {
 
         std::thread::scope(|scope| {
             let num_threads = thread::available_parallelism().map(NonZero::get).unwrap();
-            eprintln!("Number of threads: {num_threads}");
             let chunks = create_chunks(data, num_threads);
 
             let (sender, receiver) = std::sync::mpsc::channel();
             for chunk in chunks {
                 let sender = sender.clone();
-                eprintln!("spawned");
                 scope.spawn(move || sender.send(process_chunk(chunk)));
             }
 
