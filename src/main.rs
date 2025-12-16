@@ -1,12 +1,14 @@
 #![feature(slice_split_once)]
 #![feature(mpmc_channel)]
+#![feature(portable_simd)]
+#![feature(cold_path)]
 
+use memchr::memchr;
 use rustc_hash::FxHashMap;
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::num::NonZero;
-use std::os::raw::c_void;
 use std::sync::mpmc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread;
@@ -21,9 +23,9 @@ fn main() {
     static MMAP: OnceLock<memmap2::Mmap> = OnceLock::new();
     // (UN)SAFETY: If someone else modifies the file while we are reading it, we are just fucked
     let mmap = MMAP.get_or_init(|| unsafe { memmap2::Mmap::map(&file) }.unwrap());
-    mmap.advise(memmap2::Advice::Sequential).unwrap();
+    // mmap.advise(memmap2::Advice::Sequential).unwrap();
 
-    let sorted = BTreeMap::from_iter(multi_threaded::do_work(&mmap));
+    let sorted = BTreeMap::from_iter(single_threaded::do_work(&mmap));
 
     let out = sorted
         .into_iter()
@@ -71,42 +73,38 @@ impl Temperature {
     }
 }
 
-fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<Box<[u8]>, Temperature>) {
+fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>) {
     let mut rest = chunk;
 
-    while let Some(line) = next_line(&mut rest) {
+    loop {
+        let line = next_line(&mut rest);
+        if line.is_empty() {
+            break;
+        }
         let (city, temp_bytes) = split_line(line);
         let temp = Decimal::parse(temp_bytes);
-        map.entry(Box::from(city))
+        map.entry(city)
             .and_modify(|temps: &mut Temperature| temps.push(temp))
             .or_insert(Temperature::new(temp));
     }
 }
 
-fn next_line<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let line_end =
-        unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as i32, rest.len()) };
-    if line_end.is_null() {
-        return None;
-    }
-
-    let line_len = unsafe { line_end.byte_offset_from_unsigned(rest.as_ptr() as *mut u8) };
-    let line = &rest[..line_len];
-    if line.is_empty() {
-        return None;
-    }
-    *rest = &rest[line_len + 1..];
-
-    Some(line)
+fn next_line<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
+    return if let Some(line_end) = memchr(b'\n', rest) {
+        let line = &rest[..line_end];
+        *rest = &rest[line_end + 1..];
+        line
+    } else {
+        std::hint::cold_path();
+        let line = &rest[..];
+        *rest = &rest[rest.len()..];
+        line
+    };
 }
 
 fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
-    let start = line.as_ptr() as *const c_void;
-
-    // ignoring null, format specifies that there is always a semi on the line
-    let split_ptr = unsafe { libc::memchr(start, b';' as i32, line.len()) };
-    let split_pos = unsafe { split_ptr.byte_offset_from_unsigned(start as *mut u8) };
-
+    // SAFETY: format specifies that there is always a semicolon on the line
+    let split_pos = unsafe { memchr(b';', line).unwrap_unchecked() };
     (&line[..split_pos], &line[split_pos + 1..])
 }
 
@@ -159,7 +157,7 @@ impl Decimal {
 mod single_threaded {
     use super::*;
 
-    pub fn do_work(data: &[u8]) -> impl Iterator<Item = (Box<[u8]>, Temperature)> {
+    pub fn do_work(data: &[u8]) -> impl Iterator<Item = (&[u8], Temperature)> {
         let mut map = FxHashMap::default();
         process_chunk(data, &mut map);
         map.into_iter()
@@ -169,7 +167,7 @@ mod single_threaded {
 mod multi_threaded {
     use super::*;
 
-    pub fn do_work<'a>(data: &'a [u8]) -> impl Iterator<Item = (Box<[u8]>, Temperature)> {
+    pub fn do_work<'a>(data: &'a [u8]) -> impl Iterator<Item = (&'a [u8], Temperature)> {
         const DEFAUL_NUM_THREADS: usize = 4;
         let num_threads = thread::available_parallelism()
             .map(NonZero::get)
@@ -222,7 +220,7 @@ mod multi_threaded {
         eprintln!("Finished reading");
     }
 
-    fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<Box<[u8]>, Temperature> {
+    fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
         let mut map = FxHashMap::default();
         while let Ok(chunk) = receiver.recv() {
             process_chunk(chunk, &mut map);
