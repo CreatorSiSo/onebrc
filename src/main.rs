@@ -1,14 +1,12 @@
 #![feature(slice_split_once)]
-#![feature(mpmc_channel)]
-#![feature(portable_simd)]
-#![feature(cold_path)]
-use rustc_hash::FxHashMap;
+
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cmp::min;
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::num::NonZero;
 use std::os::raw::c_void;
-use std::sync::mpmc::{Receiver, Sender};
 use std::thread;
 
 fn main() {
@@ -21,15 +19,17 @@ fn main() {
     let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     // mmap.advise(memmap2::Advice::Sequential).unwrap();
 
-    let sorted = BTreeMap::from_iter(multi_threaded::do_work(&mmap));
+    let stats = multi_threaded::do_work(&mmap);
 
-    let out = sorted
+    eprintln!("Collected stats");
+
+    let out = stats
         .into_iter()
         .fold(String::new(), |mut accum, (city, temps)| {
             if !accum.is_empty() {
                 accum += ", ";
             }
-            accum.push_str(&format_entry(&city, &temps));
+            accum.push_str(&format_entry(city, &temps));
             accum
         });
 
@@ -68,7 +68,8 @@ impl Temperature {
     }
 }
 
-fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>) {
+fn process_chunk(chunk: &[u8]) -> FxHashMap<&[u8], Temperature> {
+    let mut stats = FxHashMap::with_capacity_and_hasher(1024, FxBuildHasher);
     let mut rest = chunk;
 
     loop {
@@ -78,10 +79,13 @@ fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>
         }
         let (city, temp_bytes) = split_line(line);
         let temp = Decimal::parse(temp_bytes);
-        map.entry(city)
+        stats
+            .entry(city)
             .and_modify(|temps: &mut Temperature| temps.push(temp))
             .or_insert(Temperature::new(temp));
     }
+
+    stats
 }
 
 fn next_line<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
@@ -111,11 +115,11 @@ fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
     (&line[..split_pos], &line[split_pos..])
 }
 
-fn format_entry(city: &[u8], temps: &Temperature) -> String {
+fn format_entry(city: String, temps: &Temperature) -> String {
     format!(
         "{}={:.1}/{:.1}/{:.1}",
         // SAFETY: Input is promised to be valid utf8
-        unsafe { str::from_utf8_unchecked(city) },
+        city,
         temps.min.as_f32(),
         temps.sum / temps.count as f32,
         temps.max.as_f32()
@@ -132,17 +136,19 @@ impl Decimal {
     ///
     /// decimal ::= ";" "-"? digit? digit "." digit
     /// digit ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+    #[inline(never)]
     fn parse(bytes: &[u8]) -> Self {
         #[inline(always)]
         const fn digit_from_byte(byte: u8) -> i16 {
             (byte - b'0') as i16
         }
 
+        assert!(bytes.len() >= 4);
+
         // ignore padding byte at index 0
         let first = 1;
         let last = bytes.len() - 1;
 
-        let is_negative = bytes[first] == b'-';
         let has_tens = !(bytes[last - 3] == b'-' || bytes[last - 3] == b';');
 
         let mut inner = 0i16;
@@ -150,7 +156,8 @@ impl Decimal {
         inner += digit_from_byte(bytes[last - 2]) * 10;
         inner += digit_from_byte(bytes[last - 3]) * (has_tens as i16) * 100;
 
-        inner *= if is_negative { -1 } else { 1 };
+        let sign = i16::from(bytes[first] != b'-') * 2 - 1;
+        inner *= sign;
 
         // eprintln!("{} -> {}", str::from_utf8(bytes).unwrap(), inner);
 
@@ -165,81 +172,65 @@ impl Decimal {
 mod single_threaded {
     use super::*;
 
-    pub fn do_work(data: &[u8]) -> impl Iterator<Item = (&[u8], Temperature)> {
-        let mut map = FxHashMap::default();
-        process_chunk(data, &mut map);
-        map.into_iter()
+    pub fn do_work(data: &[u8]) -> BTreeMap<String, Temperature> {
+        BTreeMap::from_iter(process_chunk(data).into_iter().map(|(city, temps)| {
+            (
+                unsafe { String::from_utf8_unchecked(Vec::from(city)) },
+                temps,
+            )
+        }))
     }
 }
 
 mod multi_threaded {
     use super::*;
 
-    pub fn do_work<'a>(data: &'a [u8]) -> impl Iterator<Item = (&'a [u8], Temperature)> {
-        const DEFAUL_NUM_THREADS: usize = 4;
-        let num_threads = thread::available_parallelism()
-            .map(NonZero::get)
-            .unwrap_or(DEFAUL_NUM_THREADS);
-
-        eprintln!("Number of threads: {num_threads}");
-
-        let (sender, receiver) = std::sync::mpmc::channel::<&[u8]>();
+    pub fn do_work<'a>(data: &'a [u8]) -> BTreeMap<String, Temperature> {
+        let mut stats = BTreeMap::new();
 
         std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|_| {
-                    let receiver = receiver.clone();
-                    scope.spawn(move || process_chunks(receiver))
-                })
-                .collect();
+            let num_threads = thread::available_parallelism().map(NonZero::get).unwrap();
+            eprintln!("Number of threads: {num_threads}");
+            let chunks = create_chunks(data, num_threads);
 
-            read_send_chunks(data, num_threads, sender);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            for chunk in chunks {
+                let sender = sender.clone();
+                eprintln!("spawned");
+                scope.spawn(move || sender.send(process_chunk(chunk)));
+            }
 
-            handles
-                .into_iter()
-                .map(|handle| {
-                    let result = handle.join().unwrap();
-                    eprintln!("Joined thread");
-                    result
-                })
-                .reduce(|mut accum, other| {
-                    for (city, temps) in other {
-                        accum
-                            .entry(city)
-                            .and_modify(|all_temps| all_temps.merge(&temps))
-                            .or_insert(temps);
-                    }
-                    accum
-                })
-                .unwrap_or_default()
-        })
-        .into_iter()
+            drop(sender);
+            for stat in receiver {
+                for (city, temps) in stat {
+                    let name = unsafe { String::from_utf8_unchecked(Vec::from(city)) };
+                    match stats.entry(name) {
+                        Entry::Vacant(vacant) => {
+                            vacant.insert(temps);
+                        }
+                        Entry::Occupied(occupied) => {
+                            occupied.into_mut().merge(&temps);
+                        }
+                    };
+                }
+            }
+        });
+
+        stats
     }
 
-    fn read_send_chunks<'a>(data: &'a [u8], n_chunks: usize, sender: Sender<&'a [u8]>) {
-        let chunk_size = data.len() / n_chunks;
+    fn create_chunks(data: &[u8], num_threads: usize) -> Vec<&[u8]> {
+        let chunk_size = data.len() / num_threads;
+        let mut chunks = Vec::new();
 
         let mut start = 0;
-        let mut i = 0;
         while start < data.len() {
             let chunk = &data[start..min(start + chunk_size, data.len())];
             let (lines, rest) = chunk.rsplit_once(|&b| b == b'\n').unwrap();
-
-            eprintln!("Sending chunk {i}, size = {}", lines.len());
-            i += 1;
-
-            sender.send(lines).unwrap();
+            chunks.push(lines);
             start += chunk_size - rest.len();
         }
 
-        eprintln!("Finished reading");
-    }
-
-    fn process_chunks(receiver: Receiver<&[u8]>) -> FxHashMap<&[u8], Temperature> {
-        let mut map = FxHashMap::default();
-        while let Ok(chunk) = receiver.recv() {
-            process_chunk(chunk, &mut map);
-        }
-        map
+        chunks
     }
 }
