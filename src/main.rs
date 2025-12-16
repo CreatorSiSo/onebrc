@@ -9,7 +9,6 @@ use std::fs::OpenOptions;
 use std::num::NonZero;
 use std::os::raw::c_void;
 use std::sync::mpmc::{Receiver, Sender};
-use std::sync::OnceLock;
 use std::thread;
 
 fn main() {
@@ -18,10 +17,8 @@ fn main() {
 
     // Open file in read-only mode
     let file = OpenOptions::new().read(true).open(path).unwrap();
-    // TODO Lock file in shared read-only mode
-    static MMAP: OnceLock<memmap2::Mmap> = OnceLock::new();
     // (UN)SAFETY: If someone else modifies the file while we are reading it, we are just fucked
-    let mmap = MMAP.get_or_init(|| unsafe { memmap2::Mmap::map(&file) }.unwrap());
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     // mmap.advise(memmap2::Advice::Sequential).unwrap();
 
     let sorted = BTreeMap::from_iter(single_threaded::do_work(&mmap));
@@ -165,6 +162,7 @@ impl Decimal {
         (self.0 as f32) / 10.0
     }
 }
+
 mod single_threaded {
     use super::*;
 
