@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 rustc-hash = "2.1.1"
 memmap2 = "0.9.9"
-memchr = { version = "2.7.6", default-features = false }
+libc = "0.2.178"
 
 [profile.bench]
 debug = true

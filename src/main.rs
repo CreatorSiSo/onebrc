@@ -2,13 +2,12 @@
 #![feature(mpmc_channel)]
 #![feature(portable_simd)]
 #![feature(cold_path)]
-
-use memchr::memchr;
 use rustc_hash::FxHashMap;
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::num::NonZero;
+use std::os::raw::c_void;
 use std::sync::mpmc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread;
@@ -90,22 +89,28 @@ fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>
 }
 
 fn next_line<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
-    let line_end = memchr(b'\n', rest);
-    return if line_end.is_none() {
+    let start = rest.as_ptr() as *const c_void;
+    let line_end = unsafe { libc::memchr(start, i32::from(b'\n'), rest.len()) };
+
+    if line_end.is_null() {
         let line = &rest[..];
         *rest = &rest[rest.len()..];
         line
     } else {
-        let line_end = unsafe { line_end.unwrap_unchecked() };
-        let line = &rest[..line_end];
-        *rest = &rest[line_end + 1..];
+        let line_len = unsafe { line_end.offset_from_unsigned(start) };
+        let line = &rest[..line_len];
+        *rest = &rest[line_len + 1..];
         line
-    };
+    }
 }
 
 fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
+    let start = line.as_ptr() as *const c_void;
+
     // SAFETY: format specifies that there is always a semicolon on the line
-    let split_pos = unsafe { memchr(b';', line).unwrap_unchecked() };
+    let split_ptr = unsafe { libc::memchr(start, i32::from(b';'), line.len()) };
+    let split_pos = unsafe { split_ptr.offset_from_unsigned(start) };
+
     (&line[..split_pos], &line[split_pos + 1..])
 }
 
