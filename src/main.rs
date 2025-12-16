@@ -90,14 +90,15 @@ fn process_chunk<'a>(chunk: &'a [u8], map: &mut FxHashMap<&'a [u8], Temperature>
 }
 
 fn next_line<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
-    return if let Some(line_end) = memchr(b'\n', rest) {
-        let line = &rest[..line_end];
-        *rest = &rest[line_end + 1..];
-        line
-    } else {
-        std::hint::cold_path();
+    let line_end = memchr(b'\n', rest);
+    return if line_end.is_none() {
         let line = &rest[..];
         *rest = &rest[rest.len()..];
+        line
+    } else {
+        let line_end = unsafe { line_end.unwrap_unchecked() };
+        let line = &rest[..line_end];
+        *rest = &rest[line_end + 1..];
         line
     };
 }
