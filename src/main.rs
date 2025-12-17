@@ -1,31 +1,85 @@
 #![feature(slice_split_once)]
+#![feature(exitcode_exit_method)]
 
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cmp::min;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
-use std::fmt::Write;
+use std::collections::btree_map::Entry;
+use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::os::raw::c_void;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::str::FromStr;
 use std::thread;
 
+struct Args {
+    path: PathBuf,
+    threads: Option<usize>,
+}
+
+impl Args {
+    fn parse(mut args: impl Iterator<Item = String>) -> Option<Self> {
+        // Skip executable path
+        args.next()?;
+
+        let mut result = Args {
+            path: PathBuf::new(),
+            threads: None,
+        };
+
+        let actual_args = args.collect::<Vec<_>>();
+        let mut current_arg = 0;
+
+        if let Some(threads_str) = actual_args.get(current_arg)
+            && threads_str.starts_with("--threads")
+        {
+            let (_, number) = threads_str.split_once('=')?;
+            result.threads = usize::from_str(number).ok();
+            current_arg += 1;
+        }
+
+        result.path = PathBuf::from_str(actual_args.get(current_arg)?).ok()?;
+
+        Some(result)
+    }
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let path = args.next().unwrap();
+    let args = match Args::parse(std::env::args()) {
+        Some(args) => args,
+        None => {
+            eprintln!("Error parsing arguments");
+            ExitCode::FAILURE.exit_process()
+        }
+    };
 
     // Open file in read-only mode
-    let file = OpenOptions::new().read(true).open(path).unwrap();
+    let file = OpenOptions::new().read(true).open(args.path).unwrap();
     // (UN)SAFETY: If someone else modifies the file while we are reading it, we are just fucked
     let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     // mmap.advise(memmap2::Advice::Sequential).unwrap();
 
-    let mut stats = BTreeMap::new();
+    let num_threads = args
+        .threads
+        .unwrap_or_else(|| thread::available_parallelism().unwrap().get());
+    let chunks = create_chunks(&mmap, num_threads);
+
+    eprintln!("Configuration:");
+    eprintln!("  Threads: {num_threads}");
+    eprintln!(
+        "  Chunks: [{}] ({})",
+        chunks
+            .iter()
+            .map(|chunk| format!("{:.1}M", (chunk.len() as f64) / (1024 * 1024) as f64))
+            .join(", "),
+        chunks.len()
+    );
+
+    let mut statistics = BTreeMap::new();
 
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        let num_threads = thread::available_parallelism().unwrap().get();
-        let chunks = create_chunks(&mmap, num_threads);
-
         for chunk in chunks {
             let sender = sender.clone();
             scope.spawn(move || sender.send(process_chunk(chunk)));
@@ -34,35 +88,32 @@ fn main() {
 
     drop(sender);
     for stat in receiver {
-        for (city, temps) in stat {
+        for (city, statistic) in stat {
             // SAFETY: Input is promised to be valid utf8
             let name = unsafe { str::from_utf8_unchecked(city) };
-            match stats.entry(name) {
+            match statistics.entry(name) {
                 Entry::Vacant(vacant) => {
-                    vacant.insert(temps);
+                    vacant.insert(statistic);
                 }
                 Entry::Occupied(occupied) => {
-                    occupied.into_mut().merge(&temps);
+                    occupied.into_mut().merge(&statistic);
                 }
             };
         }
     }
 
-    let mut out = String::new();
-    for (city, temps) in stats {
-        if !out.is_empty() {
-            out += ", ";
-        }
-        write!(
-            out,
-            "{}={:.1}/{:.1}/{:.1}",
-            city,
-            temps.min.as_f32(),
-            temps.sum / temps.count as f32,
-            temps.max.as_f32()
-        )
-        .unwrap();
-    }
+    let out = statistics
+        .iter()
+        .map(|(city, temps)| {
+            format!(
+                "{}={:.1}/{:.1}/{:.1}",
+                city,
+                temps.min.as_f32(),
+                temps.sum / temps.count as f32,
+                temps.max.as_f32()
+            )
+        })
+        .join(",");
     println!("{{{out}}}");
 }
 
@@ -212,5 +263,33 @@ impl Decimal {
 
     fn as_f32(self) -> f32 {
         (self.0 as f32) / 10.0
+    }
+}
+
+pub trait Join {
+    type Item;
+
+    /// Returns a string that contains the items separated by the separator string.
+    /// ```rust
+    /// assert_eq!((1..=5).join(", "), "1, 2, 3, 4, 5")
+    /// ```
+    fn join(&mut self, separator: impl Display) -> String
+    where
+        Self::Item: Display;
+}
+
+impl<I: Iterator> Join for I {
+    type Item = I::Item;
+
+    fn join(&mut self, separator: impl Display) -> String
+    where
+        Self::Item: Display,
+    {
+        self.fold(String::new(), |mut accum, item| {
+            if !accum.is_empty() {
+                accum += &separator.to_string()
+            }
+            accum + &item.to_string()
+        })
     }
 }
