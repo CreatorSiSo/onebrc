@@ -4,8 +4,8 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::cmp::min;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::fs::OpenOptions;
-use std::num::NonZero;
 use std::os::raw::c_void;
 use std::thread;
 
@@ -19,56 +19,77 @@ fn main() {
     let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     // mmap.advise(memmap2::Advice::Sequential).unwrap();
 
-    let stats = multi_threaded::do_work(&mmap);
+    let mut stats = BTreeMap::new();
 
-    let out = stats
-        .into_iter()
-        .fold(String::new(), |mut accum, (city, temps)| {
-            if !accum.is_empty() {
-                accum += ", ";
-            }
-            accum.push_str(&format_entry(city, &temps));
-            accum
-        });
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let num_threads = thread::available_parallelism().unwrap().get();
+        let chunks = create_chunks(&mmap, num_threads);
 
-    println!("{{{out}}}");
-}
+        for chunk in chunks {
+            let sender = sender.clone();
+            scope.spawn(move || sender.send(process_chunk(chunk)));
+        }
+    });
 
-struct Temperature {
-    min: Decimal,
-    max: Decimal,
-    sum: f32,
-    count: u32,
-}
-
-impl Temperature {
-    fn new(temp: Decimal) -> Self {
-        Self {
-            min: temp,
-            max: temp,
-            sum: temp.as_f32(),
-            count: 1,
+    drop(sender);
+    for stat in receiver {
+        for (city, temps) in stat {
+            // SAFETY: Input is promised to be valid utf8
+            let name = unsafe { str::from_utf8_unchecked(city) };
+            match stats.entry(name) {
+                Entry::Vacant(vacant) => {
+                    vacant.insert(temps);
+                }
+                Entry::Occupied(occupied) => {
+                    occupied.into_mut().merge(&temps);
+                }
+            };
         }
     }
 
-    fn push(&mut self, temp: Decimal) {
-        self.min = self.min.min(temp);
-        self.max = self.max.max(temp);
-        self.sum += temp.as_f32();
-        self.count += 1;
+    let mut out = String::new();
+    for (city, temps) in stats {
+        if !out.is_empty() {
+            out += ", ";
+        }
+        write!(
+            out,
+            "{}={:.1}/{:.1}/{:.1}",
+            city,
+            temps.min.as_f32(),
+            temps.sum / temps.count as f32,
+            temps.max.as_f32()
+        )
+        .unwrap();
     }
-
-    fn merge(&mut self, other: &Self) {
-        self.min = self.min.min(other.min);
-        self.max = self.max.max(other.max);
-        self.sum += other.sum;
-        self.count += other.count;
-    }
+    println!("{{{out}}}");
 }
 
-fn process_chunk(chunk: &[u8]) -> FxHashMap<&[u8], Temperature> {
+fn create_chunks(data: &[u8], num_threads: usize) -> Vec<&[u8]> {
+    let mut chunk_size = data.len() / num_threads;
+    if data.len() < chunk_size {
+        chunk_size = data.len();
+    }
+    let mut chunks = Vec::new();
+
+    let mut start = 0;
+    while start < data.len() {
+        let chunk = &data[start..min(start + chunk_size, data.len())];
+
+        let Some((lines, rest)) = chunk.rsplit_once(|&b| b == b'\n') else {
+            unreachable!()
+        };
+        chunks.push(lines);
+        start += chunk_size - rest.len();
+    }
+
+    chunks
+}
+
+fn process_chunk(chunk: &[u8]) -> FxHashMap<&[u8], Statistic> {
     let mut stats =
-        FxHashMap::<_, Temperature>::with_capacity_and_hasher(10_000, FxBuildHasher::default());
+        FxHashMap::<_, Statistic>::with_capacity_and_hasher(10_000, FxBuildHasher::default());
     let mut rest = chunk;
 
     loop {
@@ -81,7 +102,7 @@ fn process_chunk(chunk: &[u8]) -> FxHashMap<&[u8], Temperature> {
         if let Some(temps) = stats.get_mut(city) {
             temps.push(temp);
         } else {
-            stats.insert(city, Temperature::new(temp));
+            stats.insert(city, Statistic::new(temp));
         }
     }
 
@@ -120,14 +141,36 @@ fn split_line(line: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-fn format_entry(city: String, temps: &Temperature) -> String {
-    format!(
-        "{}={:.1}/{:.1}/{:.1}",
-        city,
-        temps.min.as_f32(),
-        temps.sum / temps.count as f32,
-        temps.max.as_f32()
-    )
+struct Statistic {
+    min: Decimal,
+    max: Decimal,
+    sum: f32,
+    count: u32,
+}
+
+impl Statistic {
+    fn new(temp: Decimal) -> Self {
+        Self {
+            min: temp,
+            max: temp,
+            sum: temp.as_f32(),
+            count: 1,
+        }
+    }
+
+    fn push(&mut self, temp: Decimal) {
+        self.min = self.min.min(temp);
+        self.max = self.max.max(temp);
+        self.sum += temp.as_f32();
+        self.count += 1;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
+    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -169,77 +212,5 @@ impl Decimal {
 
     fn as_f32(self) -> f32 {
         (self.0 as f32) / 10.0
-    }
-}
-
-mod single_threaded {
-    use super::*;
-
-    pub fn do_work(data: &[u8]) -> BTreeMap<String, Temperature> {
-        BTreeMap::from_iter(process_chunk(data).into_iter().map(|(city, temps)| {
-            (
-                // SAFETY: Input is promised to be valid utf8
-                unsafe { String::from_utf8_unchecked(Vec::from(city)) },
-                temps,
-            )
-        }))
-    }
-}
-
-mod multi_threaded {
-    use super::*;
-
-    pub fn do_work<'a>(data: &'a [u8]) -> BTreeMap<String, Temperature> {
-        let mut stats = BTreeMap::new();
-
-        std::thread::scope(|scope| {
-            let num_threads = thread::available_parallelism().map(NonZero::get).unwrap();
-            let chunks = create_chunks(data, num_threads);
-
-            let (sender, receiver) = std::sync::mpsc::channel();
-            for chunk in chunks {
-                let sender = sender.clone();
-                scope.spawn(move || sender.send(process_chunk(chunk)));
-            }
-
-            drop(sender);
-            for stat in receiver {
-                for (city, temps) in stat {
-                    // SAFETY: Input is promised to be valid utf8
-                    let name = unsafe { String::from_utf8_unchecked(Vec::from(city)) };
-                    match stats.entry(name) {
-                        Entry::Vacant(vacant) => {
-                            vacant.insert(temps);
-                        }
-                        Entry::Occupied(occupied) => {
-                            occupied.into_mut().merge(&temps);
-                        }
-                    };
-                }
-            }
-        });
-
-        stats
-    }
-
-    fn create_chunks(data: &[u8], num_threads: usize) -> Vec<&[u8]> {
-        let mut chunk_size = data.len() / num_threads;
-        if data.len() < chunk_size {
-            chunk_size = data.len();
-        }
-        let mut chunks = Vec::new();
-
-        let mut start = 0;
-        while start < data.len() {
-            let chunk = &data[start..min(start + chunk_size, data.len())];
-
-            let Some((lines, rest)) = chunk.rsplit_once(|&b| b == b'\n') else {
-                unreachable!()
-            };
-            chunks.push(lines);
-            start += chunk_size - rest.len();
-        }
-
-        chunks
     }
 }
