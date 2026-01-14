@@ -14,7 +14,7 @@ TODO: Add graph comparing to other solutions
 
 ## Dependencies
 
-Yes this implementation has dependencies, which of this is technically not allowed ...
+Yes this implementation has dependencies, which is technically not allowed ...
 but I am also not writing this in Java and the competition is over anyways.
 
 I am using `memmap2`/`libc` to access `mmap`, `madvise` and `memchr`,
